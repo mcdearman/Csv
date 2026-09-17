@@ -1,0 +1,492 @@
+-- The parser and writer underneath: the crate `csv-core` 0.1.13. The reader
+-- is its DFA, built from its NFA exactly as the crate builds it, and it is
+-- fed input and output space in the same pieces as `csv` feeds it, since the
+-- line count depends on both. The writer is its state machine, with the same
+-- partial writes.
+--
+-- Copyright Andrew Gallant and the rust-csv contributors, and the Meadow
+-- port's authors. Licensed under MIT or the Unlicense: see LICENSE-MIT,
+-- UNLICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+
+-- How records end: a carriage return, a line feed or both, or one byte.
+@pub data Terminator = CRLF | Any Int
+
+-- When the writer quotes a field.
+@pub data QuoteStyle = Always | Necessary | NonNumeric | Never
+
+-- --- the reader ---------------------------------------------------------------------------
+
+-- What the parser needs to know.
+@pub(pkg) record ReaderConfig = {
+  delimiter : Int,
+  term : Terminator,
+  quote : Int,
+  escape : Maybe Int,
+  doubleQuote : Bool,
+  comment : Maybe Int,
+  quoting : Bool
+}
+
+fun termEquals term c =
+  match term with
+  | Terminator.CRLF -> c == 13 or c == 10
+  | Terminator.Any b -> c == b
+
+fun isCrlf term =
+  match term with
+  | Terminator.CRLF -> True
+  | Terminator.Any _ -> False
+
+-- The NFA's states. The first ten are also the DFA's, in its order.
+def startRecord = 0
+
+def startField = 1
+
+def inField = 2
+
+def inQuotedField = 3
+
+def inEscapedQuote = 4
+
+def inDoubleEscapedQuote = 5
+
+def inComment = 6
+
+def endFieldDelim = 7
+
+def endRecord = 8
+
+def crlf = 9
+
+def endFieldTerm = 10
+
+def inRecordTerm = 11
+
+def theEnd = 12
+
+-- What a transition does with its byte.
+def epsilon = 0
+
+def copyToOutput = 1
+
+def discard = 2
+
+-- One NFA transition: the crate's `transition_nfa`.
+fun transition (cfg : ReaderConfig) state c =
+  match state with
+  | 12 -> (theEnd, epsilon)
+  | 0 ->
+      if termEquals cfg.term c
+      then (startRecord, discard)
+      else if cfg.comment == Just c
+      then (inComment, discard)
+      else (startField, epsilon)
+  | 8 -> (startRecord, epsilon)
+  | 1 ->
+      if cfg.quoting and cfg.quote == c
+      then (inQuotedField, discard)
+      else if cfg.delimiter == c
+      then (endFieldDelim, discard)
+      else if termEquals cfg.term c
+      then (endFieldTerm, epsilon)
+      else (inField, copyToOutput)
+  | 7 -> (startField, epsilon)
+  | 10 -> (inRecordTerm, epsilon)
+  | 2 ->
+      if cfg.delimiter == c
+      then (endFieldDelim, discard)
+      else if termEquals cfg.term c
+      then (endFieldTerm, epsilon)
+      else (inField, copyToOutput)
+  | 3 ->
+      if cfg.quoting and cfg.quote == c
+      then (inDoubleEscapedQuote, discard)
+      else if cfg.quoting and cfg.escape == Just c
+      then (inEscapedQuote, discard)
+      else (inQuotedField, copyToOutput)
+  | 4 -> (inQuotedField, copyToOutput)
+  | 5 ->
+      if cfg.quoting and cfg.doubleQuote and cfg.quote == c
+      then (inQuotedField, copyToOutput)
+      else if cfg.delimiter == c
+      then (endFieldDelim, discard)
+      else if termEquals cfg.term c
+      then (endFieldTerm, epsilon)
+      else (inField, copyToOutput)
+  | 6 -> if c == 10 then (startRecord, discard) else (inComment, discard)
+  | 11 -> if isCrlf cfg.term and c == 13 then (crlf, discard) else (endRecord, discard)
+  | _ -> if c == 10 then (startRecord, discard) else (startRecord, epsilon)
+
+-- Transitions from `state` on `c` until one consumes it.
+fun closure cfg state c =
+  let rec go s action =
+    if s != theEnd and action == epsilon
+    then
+      match transition cfg s c with
+      | (s2, a2) -> go s2 a2
+    else (s, action)
+  in
+  go state epsilon
+
+-- The parser: its configuration, its byte classes and transition table, and
+-- where it is.
+@pub(pkg) record CoreReader = {
+  cfg : ReaderConfig,
+  classes : #[Int],
+  table : #[(Int, Bool)],
+  numClasses : Int,
+  state : Int,
+  line : Int,
+  hasRead : Bool,
+  outputPos : Int
+}
+
+-- The byte classes: each special byte its own class, added in the crate's
+-- order, and everything else class 0. A byte added twice keeps the later
+-- class.
+fun classesOf (cfg : ReaderConfig) =
+  let quoted =
+    if cfg.quoting
+    then
+      match cfg.escape with
+      | Just e -> [cfg.quote, e]
+      | None -> [cfg.quote]
+    else []
+  in
+  let commented =
+    match cfg.comment with
+    | Just c -> [c]
+    | None -> []
+  in
+  let termBytes =
+    match cfg.term with
+    | Terminator.Any b -> [b]
+    | Terminator.CRLF -> [13, 10]
+  in
+  let special = V.concat [[cfg.delimiter], quoted, commented, termBytes] in
+  match
+    V.foldl
+      (\(table, next) b -> (V.set table b next, next + 1))
+      (V.replicate 256 0, 1)
+      special
+  with
+  | (table, next) -> (V.toArray table, next)
+
+-- A parser for `cfg`, at the start: the crate's `build_dfa`. Each table
+-- entry is the transition of the highest byte in its class, as the crate's
+-- last write leaves it.
+@pub(pkg) fun coreReader (cfg : ReaderConfig) =
+  match classesOf cfg with
+  | (classes, n) ->
+      let representative =
+        \k ->
+          let rec find c = if c < 0 then None else if arrayGet classes c == k then Just c else find (c - 1) in
+          find 255
+      in
+      let reps = V.map representative (V.range 0 n) in
+      let entry =
+        \state k ->
+          match V.getOr None reps k with
+          | Just c ->
+              (match closure cfg state c with
+               | (to, action) -> (to, action == copyToOutput))
+          | None -> (0, False)
+      in
+      let table = V.concatMap (\state -> V.map (\k -> entry state k) (V.range 0 n)) (V.range 0 10) in
+      CoreReader {
+        cfg = cfg,
+        classes = classes,
+        table = V.toArray table,
+        numClasses = n,
+        state = startRecord,
+        line = 1,
+        hasRead = False,
+        outputPos = 0
+      }
+
+-- What one call of the parser ended with.
+@pub(pkg) data Step = InputEmpty | OutputFull | OutputEndsFull | GotRecord | AtEnd
+
+fun stepOf state isFinal inputDone outputDone endsDone =
+  if state >= endRecord
+  then Step.GotRecord
+  else if isFinal and state == startRecord
+  then Step.AtEnd
+  else if not inputDone and outputDone
+  then Step.OutputFull
+  else if not inputDone and endsDone
+  then Step.OutputEndsFull
+  else Step.InputEmpty
+
+-- Where the parser goes at the end of the input: the crate's
+-- `transition_final_dfa`. The start state doubles as the final one.
+fun finalState state = if state >= endRecord or state == startRecord then startRecord else endRecord
+
+fun byteAt (input : #[UInt8]) i = toInt (arrayGet input i)
+
+-- Reads from `input[start..stop]` into at most `outSpace` bytes of fields
+-- and `endsSpace` field ends: the crate's `read_record`. Gives what the call
+-- ended with, the bytes consumed, the field bytes and ends written, and the
+-- parser after it.
+@pub(pkg) fun parseRecord (r : CoreReader) (input : #[UInt8]) start stop outSpace endsSpace =
+  let bom =
+    not r.hasRead
+      and stop - start >= 3
+      and byteAt input start == 239
+      and byteAt input (start + 1) == 187
+      and byteAt input (start + 2) == 191
+  in
+  let from = if bom then start + 3 else start in
+  let bomLen = if bom then 3 else 0 in
+  let read = { r | hasRead = True } in
+  if from >= stop
+  then
+    let s = finalState r.state in
+    match stepOf s True False False False with
+    | Step.GotRecord ->
+        if endsSpace == 0
+        then (Step.OutputEndsFull, bomLen, V.empty, V.empty, read)
+        else (Step.GotRecord, bomLen, V.empty, [r.outputPos], { read | state = s, outputPos = 0 })
+    | step -> (step, bomLen, V.empty, V.empty, { read | state = s })
+  else if outSpace == 0
+  then (Step.OutputFull, bomLen, V.empty, V.empty, read)
+  else if endsSpace == 0
+  then (Step.OutputEndsFull, bomLen, V.empty, V.empty, read)
+  else
+    let n = r.numClasses in
+    let scan =
+      \i out ->
+        let rec go j acc =
+          if j < stop and V.len acc < outSpace and arrayGet r.classes (byteAt input j) == 0
+          then go (j + 1) (V.pushBack acc (arrayGet input j))
+          else (j, acc)
+        in
+        go i out
+    in
+    let rec loop i out ends state line =
+      if i < stop and V.len out < outSpace and V.len ends < endsSpace
+      then
+        let b = byteAt input i in
+        match arrayGet r.table (state * n + arrayGet r.classes b) with
+        | (next, copies) ->
+            let out1 = if copies then V.pushBack out (arrayGet input i) else out in
+            let line1 = if b == 10 then line + 1 else line in
+            let ends1 = if next >= endFieldDelim then V.pushBack ends (r.outputPos + V.len out1) else ends in
+            if next > endFieldDelim
+            then (i + 1, out1, ends1, next, line1)
+            else if next == inField or next == inQuotedField
+            then
+              match scan (i + 1) out1 with
+              | (j, out2) -> loop j out2 ends1 next line1
+            else loop (i + 1) out1 ends1 next line1
+      else (i, out, ends, state, line)
+    in
+    match loop from V.empty V.empty r.state r.line with
+    | (i, out, ends, state, line) ->
+        let step = stepOf state False (i >= stop) (V.len out >= outSpace) (V.len ends >= endsSpace) in
+        let pos =
+          match step with
+          | Step.GotRecord -> 0
+          | _ -> r.outputPos + V.len out
+        in
+        (step, i - from + bomLen, out, ends, { read | state = state, line = line, outputPos = pos })
+
+-- --- the writer ---------------------------------------------------------------------------
+
+-- What the writer needs to know.
+@pub(pkg) record WriterConfig = {
+  delimiter : Int,
+  term : Terminator,
+  style : QuoteStyle,
+  quote : Int,
+  escape : Int,
+  doubleQuote : Bool,
+  comment : Maybe Int
+}
+
+-- The bytes that make a field need quotes: the crate's `requires_quotes`.
+@pub(pkg) fun requiresQuotes (cfg : WriterConfig) =
+  let escaped = if cfg.doubleQuote then [] else [cfg.escape] in
+  let termBytes =
+    match cfg.term with
+    | Terminator.CRLF -> [13, 10]
+    | Terminator.Any 10 -> [13, 10]
+    | Terminator.Any 13 -> [13, 10]
+    | Terminator.Any b -> [b]
+  in
+  let commented =
+    match cfg.comment with
+    | Just c -> [c]
+    | None -> []
+  in
+  V.toArray
+    (V.foldl
+      (\table b -> V.set table b True)
+      (V.replicate 256 False)
+      (V.concat [[cfg.delimiter, cfg.quote], escaped, termBytes, commented]))
+
+-- Whether `s` fails to parse as a Rust `f64`: optionally signed `inf`,
+-- `infinity` or `nan` in any case, or digits with an optional point and
+-- exponent. (Anything an `i128` parses, an `f64` parses too.)
+@pub fun isNonNumeric (bytes : #[UInt8]) =
+  let n = arrayLen bytes in
+  let at = \i -> if i < n then byteAt bytes i else 0 - 1 in
+  let isDigit = \c -> c >= 48 and c <= 57 in
+  let lower = \c -> if c >= 65 and c <= 90 then c + 32 else c in
+  let signed = if at 0 == 43 or at 0 == 45 then 1 else 0 in
+  let rest = V.map (\i -> lower (at i)) (V.range signed n) in
+  let word = \w -> rest == V.map toInt (V.fromArray (stringToBytes w)) in
+  let rec digits i = if isDigit (at i) then digits (i + 1) else i in
+  let intEnd = digits signed in
+  let fracEnd = if at intEnd == 46 then digits (intEnd + 1) else intEnd in
+  let mantissaDigits = (intEnd - signed) + (if at intEnd == 46 then fracEnd - intEnd - 1 else 0) in
+  let expEnd =
+    if lower (at fracEnd) == 101
+    then
+      let expSign = if at (fracEnd + 1) == 43 or at (fracEnd + 1) == 45 then fracEnd + 2 else fracEnd + 1 in
+      let e = digits expSign in
+      if e > expSign then e else 0 - 1
+    else fracEnd
+  in
+  let numeric = mantissaDigits > 0 and expEnd == n in
+  not (word "inf" or word "infinity" or word "nan" or numeric)
+
+-- The writer's state within a record.
+@pub(pkg) record CoreWriter = {
+  cfg : WriterConfig,
+  special : #[Bool],
+  inField : Bool,
+  quoting : Bool,
+  recordBytes : Int
+}
+
+@pub(pkg) fun coreWriter (cfg : WriterConfig) =
+  CoreWriter { cfg = cfg, special = requiresQuotes cfg, inField = False, quoting = False, recordBytes = 0 }
+
+@pub(pkg) fun shouldQuote (w : CoreWriter) (field : #[UInt8]) =
+  let cfg = w.cfg in
+  match cfg.style with
+  | QuoteStyle.Always -> True
+  | QuoteStyle.Never -> False
+  | QuoteStyle.NonNumeric -> isNonNumeric field
+  | QuoteStyle.Necessary ->
+      let n = arrayLen field in
+      let rec any i = if i >= n then False else if arrayGet w.special (byteAt field i) then True else any (i + 1) in
+      any 0
+
+-- A write: whether it stopped for want of space, the input bytes it
+-- consumed, and the bytes it wrote.
+fun optimistic (input : #[UInt8]) from stop space =
+  let n = stop - from in
+  if n > space
+  then (False, space, V.fromArray (arraySlice input from (from + space)))
+  else (True, n, V.fromArray (arraySlice input from stop))
+
+-- `input[from..]` with its quotes escaped, in at most `space` bytes: the
+-- crate's `quote`.
+@pub(pkg) fun quoteInto (input : #[UInt8]) from space quote escape doubleQuote =
+  let stop = arrayLen input in
+  let rec next i = if i >= stop then None else if byteAt input i == quote then Just i else next (i + 1) in
+  let rec go i room out =
+    match next i with
+    | None ->
+        (match optimistic input i stop room with
+         | (done, used, bytes) -> (done, i + used - from, V.append out bytes))
+    | Just q ->
+        match optimistic input i q room with
+        | (False, used, bytes) -> (False, i + used - from, V.append out bytes)
+        | (True, used, bytes) ->
+            let left = room - used in
+            let out1 = V.append out bytes in
+            if left < 2
+            then (False, q - from, out1)
+            else
+              let pair = if doubleQuote then [toUInt8 quote, toUInt8 quote] else [toUInt8 escape, toUInt8 quote] in
+              go (q + 1) (left - 2) (V.append out1 pair)
+  in
+  go from space V.empty
+
+-- Writes a field, or what fits of it: the crate's `Writer::field`. Gives
+-- whether it all fitted, the bytes consumed and written, and the writer.
+@pub(pkg) fun writeField (w : CoreWriter) (input : #[UInt8]) from space =
+  let opening =
+    if w.inField
+    then Just (w, space, V.empty)
+    else
+      let quoting = shouldQuote w (arraySlice input from (arrayLen input)) in
+      let w1 = { w | quoting = quoting } in
+      if quoting
+      then
+        if space < 1
+        then None
+        else Just ({ w1 | recordBytes = w1.recordBytes + 1 }, space - 1, [toUInt8 w.cfg.quote])
+      else Just (w1, space, V.empty)
+  in
+  match opening with
+  | None -> (False, 0, V.empty, { w | quoting = shouldQuote w (arraySlice input from (arrayLen input)) })
+  | Just (w2, room, prefix) ->
+      let w3 = { w2 | inField = True } in
+      let cfg = w3.cfg in
+      let written =
+        if w3.quoting
+        then quoteInto input from room cfg.quote cfg.escape cfg.doubleQuote
+        else optimistic input from (arrayLen input) room
+      in
+      match written with
+      | (done, used, bytes) ->
+          (done, used, V.append prefix bytes, { w3 | recordBytes = w3.recordBytes + V.len bytes })
+
+-- Ends a field: the crate's `Writer::delimiter`. Gives whether it fitted,
+-- the bytes written, and the writer.
+@pub(pkg) fun writeDelimiter (w : CoreWriter) space =
+  let cfg = w.cfg in
+  if w.quoting
+  then
+    if space < 1
+    then (False, V.empty, w)
+    else
+      let w1 = { w | recordBytes = w.recordBytes + 1, quoting = False } in
+      if space < 2
+      then (False, [toUInt8 cfg.quote], w1)
+      else
+        let w2 = { w1 | recordBytes = w1.recordBytes + 1, inField = False } in
+        (True, [toUInt8 cfg.quote, toUInt8 cfg.delimiter], w2)
+  else if space < 1
+  then (False, V.empty, w)
+  else (True, [toUInt8 cfg.delimiter], { w | recordBytes = w.recordBytes + 1, inField = False })
+
+fun termBytesOf term =
+  match term with
+  | Terminator.CRLF -> [toUInt8 13, toUInt8 10]
+  | Terminator.Any b -> [toUInt8 b]
+
+-- Ends a record: the crate's `Writer::terminator`. An empty record is
+-- written as `""`.
+@pub(pkg) fun writeTerminator (w : CoreWriter) space =
+  let cfg = w.cfg in
+  let quoteByte = toUInt8 cfg.quote in
+  let emptied =
+    if w.recordBytes == 0
+    then if space < 2 then None else Just (V.fromArray #[quoteByte, quoteByte], space - 2, { w | recordBytes = 2 })
+    else Just (V.empty, space, w)
+  in
+  match emptied with
+  | None -> (False, V.empty, w)
+  | Just (out0, room0, w0) ->
+      let closed =
+        if w0.quoting
+        then
+          if room0 < 1
+          then None
+          else Just (V.pushBack out0 quoteByte, room0 - 1, { w0 | recordBytes = w0.recordBytes + 1, quoting = False })
+        else Just (out0, room0, w0)
+      in
+      match closed with
+      | None -> (False, V.empty, w0)
+      | Just (out1, room1, w1) ->
+          let term = termBytesOf cfg.term in
+          if V.len term > room1
+          then (False, out1, w1)
+          else (True, V.append out1 term, { w1 | recordBytes = 0, inField = False })

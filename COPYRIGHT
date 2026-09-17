@@ -1,0 +1,8 @@
+csv (the Meadow package) is a port of the Rust crates csv and csv-core
+(https://github.com/BurntSushi/rust-csv), versions 1.4.0 and 0.1.13, by
+Andrew Gallant and contributors, to Meadow. Its test cases are generated from
+those crates, and its code is translated from their source.
+
+csv and csv-core are dual-licensed under the MIT license and the Unlicense,
+and so is this port: you may use it under the terms of either. See
+LICENSE-MIT, UNLICENSE and COPYING (the crates').

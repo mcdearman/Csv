@@ -1,0 +1,364 @@
+-- Reading CSV: the crate's `reader.rs`. The input is held in memory and
+-- handed to the parser a buffer's worth at a time, as the crate's
+-- `BufReader` hands it over, and each way of reading keeps its own record
+-- buffers, as the crate's callers do: the line numbers in positions depend on
+-- both.
+--
+-- Copyright Andrew Gallant and the rust-csv contributors, and the Meadow
+-- port's authors. Licensed under MIT or the Unlicense: see LICENSE-MIT,
+-- UNLICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.Char as C
+use Std.Maybe as M
+use csv.Core
+use csv.Record
+
+-- Which fields and headers are trimmed of whitespace.
+@pub data Trim = NoTrim | Headers | Fields | All
+
+fun trimsFields t =
+  match t with
+  | Trim.Fields -> True
+  | Trim.All -> True
+  | _ -> False
+
+fun trimsHeaders t =
+  match t with
+  | Trim.Headers -> True
+  | Trim.All -> True
+  | _ -> False
+
+-- How to read: the crate's `ReaderBuilder`, with its defaults. Change it
+-- with the `with` functions, which also change a `writerBuilder`.
+@pub def readerBuilder =
+  {
+    capacity = (toInt 8192),
+    flexible = False,
+    hasHeaders = True,
+    trim = Trim.NoTrim,
+    delimiter = (toInt 44),
+    terminator = Terminator.CRLF,
+    quote = (toInt 34),
+    escape = None,
+    doubleQuote = True,
+    quoting = True,
+    comment = None
+  }
+
+fun byteOf c = C.code c % 256
+
+-- The byte between fields: an ASCII character. (A character past U+00FF is
+-- taken modulo 256, as Rust's `as u8` takes it.)
+@pub fun withDelimiter c b = { b | delimiter = byteOf c }
+
+-- Whether the first record is headers rather than data.
+@pub fun withHasHeaders yes b = { b | hasHeaders = yes }
+
+-- Whether records may have different numbers of fields.
+@pub fun withFlexible yes b = { b | flexible = yes }
+
+@pub fun withTrim t b = { b | trim = t }
+
+-- The record terminator: `CRLF`, which reads `\r`, `\n` and `\r\n`, or
+-- `Any byte`.
+@pub fun withTerminator t b = { b | terminator = t }
+
+@pub fun withQuote c b = { b | quote = byteOf c }
+
+-- The reader's escape character, which escapes a quote inside quotes, or
+-- `None`.
+@pub fun withEscape (e : Maybe Char) b = { b | escape = M.map byteOf e }
+
+-- Whether two quotes inside quotes are one.
+@pub fun withDoubleQuote yes b = { b | doubleQuote = yes }
+
+-- Whether quotes are special at all.
+@pub fun withQuoting yes b = { b | quoting = yes }
+
+-- The character that makes a line a comment, when it starts one, or `None`.
+@pub fun withComment (c : Maybe Char) b = { b | comment = M.map byteOf c }
+
+-- ASCII's unit and record separators as delimiter and terminator.
+@pub fun withAscii b = { b | delimiter = (toInt 31), terminator = Terminator.Any (toInt 30) }
+
+-- The size of the reading buffer, which is 8 KiB by default. It changes only
+-- the line numbers the crate counts where a line feed is not special.
+@pub fun withBufferCapacity n b = { b | capacity = n }
+
+record Headers = { bytes : Filled, text : Result (Int, Int) Filled }
+
+-- A reader, and where it is in its input.
+@pub record Reader = {
+  core : CoreReader,
+  input : #[UInt8],
+  consumed : Int,
+  filled : Int,
+  capacity : Int,
+  headers : Maybe Headers,
+  hasHeaders : Bool,
+  flexible : Bool,
+  trim : Trim,
+  firstFieldCount : Maybe Int,
+  pos : Position,
+  first : Bool,
+  eof : Bool,
+  textBuffer : Filled,
+  byteBuffer : Filled
+}
+
+-- A reader of `bytes`, configured by `b`.
+@pub fun fromBytes (bytes : #[UInt8]) b =
+  let cfg =
+    ReaderConfig {
+      delimiter = b.delimiter,
+      term = b.terminator,
+      quote = b.quote,
+      escape = b.escape,
+      doubleQuote = b.doubleQuote,
+      comment = b.comment,
+      quoting = b.quoting
+    }
+  in
+  Reader {
+    core = coreReader cfg,
+    input = bytes,
+    consumed = 0,
+    filled = 0,
+    capacity = b.capacity,
+    headers = None,
+    hasHeaders = b.hasHeaders,
+    flexible = b.flexible,
+    trim = b.trim,
+    firstFieldCount = None,
+    pos = startPosition,
+    first = False,
+    eof = False,
+    textBuffer = emptyFilled,
+    byteBuffer = emptyFilled
+  }
+
+-- A reader of `text`.
+@pub fun fromString text b = fromBytes (stringToBytes text) b
+
+-- Where the reader is: the start of the next record.
+@pub fun position (r : Reader) = r.pos
+
+-- Whether the reader has reached the end of its input.
+@pub fun isDone (r : Reader) = r.eof
+
+@pub fun hasHeaders (r : Reader) = r.hasHeaders
+
+-- The next buffer's worth of input, once the last is used up.
+fun fillBuffer (r : Reader) =
+  if r.consumed >= r.filled
+  then { r | filled = r.consumed + min r.capacity (arrayLen r.input - r.consumed) }
+  else r
+
+-- The fields of `bytes`, split at `ends`.
+fun splitFields (bytes : [UInt8]) ends =
+  let arr = V.toArray bytes in
+  match
+    V.foldl (\(acc, start) stop -> (V.pushBack acc (arraySlice arr start stop), stop)) (V.empty, 0) ends
+  with
+  | (fields, _) -> fields
+
+-- Counts the record, and checks its length against the first's.
+fun addRecord (f : Filled) (r : Reader) =
+  let p = r.pos in
+  let counted = { r | pos = { p | index = p.index + 1 } } in
+  let len = V.len f.fields in
+  if r.flexible
+  then (Ok True, counted)
+  else
+    match r.firstFieldCount with
+    | None -> (Ok True, { counted | firstFieldCount = Just len })
+    | Just expected ->
+        if len != expected then (Err (CsvError.UnequalLengths f.position expected len), counted) else (Ok True, counted)
+
+-- One record into a buffer with the room of `buf`: the crate's
+-- `read_byte_record_impl`.
+fun readImpl (r : Reader) (buf : Filled) =
+  let start = { buf | fields = V.empty, position = Just r.pos } in
+  if r.eof
+  then (Ok False, start, r)
+  else
+    let rec loop (rd : Reader) (f : Filled) out ends =
+      let r1 = fillBuffer rd in
+      match parseRecord r1.core r1.input r1.consumed r1.filled (f.fieldsCap - V.len out) (f.endsCap - V.len ends) with
+      | (step, nin, bytes, newEnds, core) ->
+          let p = r1.pos in
+          let moved = { p | byte = p.byte + nin, line = core.line } in
+          let r2 = { r1 | core = core, consumed = r1.consumed + nin, pos = moved } in
+          let out1 = V.append out bytes in
+          let ends1 = V.append ends newEnds in
+          match step with
+          | Step.InputEmpty -> loop r2 f out1 ends1
+          | Step.OutputFull ->
+              loop r2 { f | fieldsCap = if 2 * f.fieldsCap > 4 then 2 * f.fieldsCap else 4 } out1 ends1
+          | Step.OutputEndsFull -> loop r2 { f | endsCap = if 2 * f.endsCap > 4 then 2 * f.endsCap else 4 } out1 ends1
+          | Step.GotRecord ->
+              let done = { f | fields = splitFields out1 ends1 } in
+              (match addRecord done r2 with
+               | (result, r3) -> (result, done, r3))
+          | Step.AtEnd -> (Ok False, f, { r2 | eof = True })
+    in
+    loop r start V.empty V.empty
+
+-- Sets the headers from bytes (`Err`) or text (`Ok`): the crate's
+-- `set_headers_impl`.
+fun setHeadersFrom (given : Result Filled Filled) (r : Reader) =
+  let (bytes : Filled) =
+    match given with
+    | Ok f -> f
+    | Err f -> f
+  in
+  let text =
+    match given with
+    | Ok f -> Ok f
+    | Err f ->
+        match validate f with
+        | Just bad -> Err bad
+        | None -> Ok f
+  in
+  let trimmed = trimsHeaders r.trim in
+  let text1 =
+    match text with
+    | Ok f -> Ok (if trimmed then trimText f else f)
+    | Err e -> Err e
+  in
+  let bytes1 = if trimmed then trimBytes bytes else bytes in
+  { r | headers = Just (Headers { bytes = bytes1, text = text1 }) }
+
+fun trimmedFields (r : Reader) f = if trimsFields r.trim then trimBytes f else f
+
+-- One record as bytes, into a buffer with the room of `buf`: the crate's
+-- `read_byte_record`, headers and all.
+fun readBytes (r : Reader) (buf : Filled) =
+  let replay = if not r.hasHeaders and not r.first then r.headers else None in
+  match replay with
+  | Just h ->
+      let f = trimmedFields r h.bytes in
+      (Ok (not (V.isEmpty f.fields)), f, { r | first = True })
+  | None ->
+      match readImpl r buf with
+      | (Err e, f, r1) -> (Err e, f, r1)
+      | (Ok ok, f, r1) ->
+          let r2 = { r1 | first = True } in
+          match r2.headers with
+          | Just _ -> (Ok ok, trimmedFields r2 f, r2)
+          | None ->
+              let r3 = setHeadersFrom (Err f) r2 in
+              if r3.hasHeaders
+              then
+                match readImpl r3 f with
+                | (result, f2, r4) -> (result, trimmedFields r4 f2, r4)
+              else (Ok ok, trimmedFields r3 f, r3)
+
+-- A record as text, into a buffer with the room of `buf`: the crate's
+-- `read_record`.
+fun readText (r : Reader) (buf : Filled) =
+  let before = r.pos in
+  match readBytes r buf with
+  | (result, f, r1) ->
+      let bad = validate f in
+      let f1 =
+        match bad with
+        | Just _ -> { f | fields = V.empty }
+        | None -> f
+      in
+      let checked =
+        match (result, bad) with
+        | (Err e, _) -> Err e
+        | (Ok _, Just (fieldIndex, upTo)) -> Err (CsvError.Utf8 (Just before) fieldIndex upTo)
+        | (Ok ok, None) -> Ok ok
+      in
+      (checked, if trimsFields r1.trim then trimText f1 else f1, r1)
+
+fun asRecord result (f : Filled) convert =
+  match result with
+  | Ok True -> Ok (Just (convert f))
+  | Ok False -> Ok None
+  | Err e -> Err e
+
+-- The next record, or `None` at the end. With headers, the first record is
+-- read as the headers and skipped.
+@pub fun readRecord (r : Reader) =
+  match readText r r.textBuffer with
+  | (result, f, r1) -> (asRecord result f toStringRecord, { r1 | textBuffer = f })
+
+-- The next record, as bytes.
+@pub fun readByteRecord (r : Reader) =
+  match readBytes r r.byteBuffer with
+  | (result, f, r1) -> (asRecord result f toByteRecord, { r1 | byteBuffer = f })
+
+-- Reads the headers now, if they have not been read.
+fun ensureHeaders (r : Reader) =
+  match r.headers with
+  | Just _ -> Ok r
+  | None ->
+      match readImpl r emptyFilled with
+      | (Err e, _, r1) -> Err (e, r1)
+      | (Ok _, f, r1) -> Ok (setHeadersFrom (Err f) r1)
+
+-- The first record, as headers, whether or not the reader has them.
+@pub fun headers (r : Reader) =
+  match ensureHeaders r with
+  | Err (e, r1) -> (Err e, r1)
+  | Ok r1 ->
+      match r1.headers with
+      | Just h ->
+          (match h.text with
+           | Ok f -> (Ok (toStringRecord f), r1)
+           | Err (fieldIndex, upTo) -> (Err (CsvError.Utf8 h.bytes.position fieldIndex upTo), r1))
+      | None -> (Ok (stringRecord V.empty), r1)
+
+-- The headers, as bytes.
+@pub fun byteHeaders (r : Reader) =
+  match ensureHeaders r with
+  | Err (e, r1) -> (Err e, r1)
+  | Ok r1 ->
+      match r1.headers with
+      | Just h -> (Ok (toByteRecord h.bytes), r1)
+      | None -> (Ok (byteRecord V.empty), r1)
+
+-- Headers of your own, in place of any read.
+@pub fun setHeaders fields (r : Reader) = setHeadersFrom (Ok (filledOf (V.map stringToBytes fields))) r
+
+@pub fun setByteHeaders fields (r : Reader) = setHeadersFrom (Err (filledOf fields)) r
+
+-- Reads records with a fresh buffer, as the crate's iterators do, until the
+-- end: every record or error, and the reader after them.
+fun collect (r : Reader) step =
+  let rec go (rd : Reader) buf acc =
+    match step rd buf with
+    | (Ok None, _, r1) -> (acc, r1)
+    | (Ok (Just x), f, r1) -> go r1 f (V.pushBack acc (Ok x))
+    | (Err e, f, r1) -> go r1 f (V.pushBack acc (Err e))
+  in
+  go r emptyFilled V.empty
+
+-- The rest of the records: the crate's `records`.
+@pub fun records (r : Reader) =
+  collect r (\rd buf ->
+    match readText rd buf with
+    | (result, f, r1) -> (asRecord result f toStringRecord, f, r1))
+
+-- The rest of the records, as bytes: the crate's `byte_records`.
+@pub fun byteRecords (r : Reader) =
+  collect r (\rd buf ->
+    match readBytes rd buf with
+    | (result, f, r1) -> (asRecord result f toByteRecord, f, r1))
+
+-- Every record of `text`, read as `b` says, or the first error.
+@pub fun readAll text b =
+  match records (fromString text b) with
+  | (results, _) ->
+      V.foldl
+        (\acc x ->
+          match (acc, x) with
+          | (Err e, _) -> Err e
+          | (Ok rs, Ok rec) -> Ok (V.pushBack rs rec)
+          | (Ok _, Err e) -> Err e)
+        (Ok V.empty)
+        results

@@ -1,0 +1,341 @@
+-- The port against the crate: every reading, writing and number in
+-- `Cases.mw`, done by the same steps as the crate did them, plus a few
+-- examples.
+--
+-- Every declaration carries `@cfg(test)`, as the tests are no part of the
+-- package.
+
+@cfg(test)
+use Std.Test (assertEq)
+@cfg(test)
+use Std.Collections.Vector as V
+@cfg(test)
+use Std.Result as Result
+@cfg(test)
+use Std.Maybe as Maybe
+@cfg(test)
+use Std.Char as C
+@cfg(test)
+use csv.Cases (readings, writings, numbers)
+@cfg(test)
+use csv.Core
+@cfg(test)
+use csv.Record
+@cfg(test)
+use csv.Reader
+@cfg(test)
+use csv.Writer
+
+-- --- reading the cases --------------------------------------------------------------------
+
+@cfg(test)
+fun num s i n =
+  let rec go k acc = if k >= n then acc else go (k + 1) (acc * 64 + (toInt (stringByteAt s (i + k)) - 48)) in
+  (go 0 0, i + n)
+
+@cfg(test)
+fun str s i =
+  let len = fst (num s i 3) in
+  (stringSlice s (i + 3) (i + 3 + len), i + 3 + len)
+
+@cfg(test)
+fun flag s i = mapFst (\n -> n == 1) (num s i 1)
+
+@cfg(test)
+fun bytesAt s i =
+  let n = num s i 3 in
+  (V.toArray (V.map (\k -> toUInt8 (fst (num s (snd n + 2 * k) 2))) (V.range 0 (fst n))), snd n + 2 * fst n)
+
+@cfg(test)
+fun maybeByte s i =
+  match flag s i with
+  | (True, at) -> mapFst Just (num s at 2)
+  | (False, at) -> (None, at)
+
+-- Runs `f` `n` times from `i`, threading `acc` through.
+@cfg(test)
+fun times n i acc f =
+  let rec go k at a =
+    if k >= n
+    then (a, at)
+    else
+      match f at a with
+      | (a2, next) -> go (k + 1) next a2
+  in
+  go 0 i acc
+
+@cfg(test)
+fun listOf n i read =
+  times n i V.empty (\at acc ->
+    let x = read at in
+    (V.pushBack acc (fst x), snd x))
+
+@cfg(test)
+fun charOf b = C.fromCode b
+
+-- What an operation gave, in a form both sides can be compared in.
+@cfg(test)
+data Seen = Nothing | Got [#[UInt8]] (Maybe Position) | Failed String | Many [Seen] | Ended Position Bool
+
+@cfg(test)
+fun readPosition s i =
+  match flag s i with
+  | (False, at) -> (None, at)
+  | (True, at) ->
+      let b = num s at 3 in
+      let l = num s (snd b) 3 in
+      let r = num s (snd l) 3 in
+      (Just (Position { byte = fst b, line = fst l, index = fst r }), snd r)
+
+@cfg(test)
+fun readSeen s i =
+  match num s i 1 with
+  | (0, at) -> (Seen.Nothing, at)
+  | (1, at) ->
+      let n = num s at 2 in
+      let fields = listOf (fst n) (snd n) (\p -> bytesAt s p) in
+      mapFst (Seen.Got (fst fields)) (readPosition s (snd fields))
+  | (_, at) -> mapFst Seen.Failed (str s at)
+
+@cfg(test)
+fun seenText result =
+  match result with
+  | Ok (Just (r : StringRecord)) -> Seen.Got (V.map stringToBytes r.fields) r.position
+  | Ok None -> Seen.Nothing
+  | Err e -> Seen.Failed (errorMessage e)
+
+@cfg(test)
+fun seenBytes result =
+  match result with
+  | Ok (Just (r : ByteRecord)) -> Seen.Got r.fields r.position
+  | Ok None -> Seen.Nothing
+  | Err e -> Seen.Failed (errorMessage e)
+
+@cfg(test)
+def trims = [Trim.NoTrim, Trim.Headers, Trim.Fields, Trim.All]
+
+@cfg(test)
+fun readReaderConfig s i =
+  let delimiter = num s i 2 in
+  let crlf = flag s (snd delimiter) in
+  let term = if fst crlf then (Terminator.CRLF, snd crlf) else mapFst Terminator.Any (num s (snd crlf) 2) in
+  let quote = num s (snd term) 2 in
+  let escape = maybeByte s (snd quote) in
+  let doubled = flag s (snd escape) in
+  let quoting = flag s (snd doubled) in
+  let comment = maybeByte s (snd quoting) in
+  let flexible = flag s (snd comment) in
+  let headers = flag s (snd flexible) in
+  let trim = num s (snd headers) 1 in
+  let capacity = num s (snd trim) 3 in
+  let ascii = flag s (snd capacity) in
+  let b =
+    readerBuilder
+      |> withDelimiter (charOf (fst delimiter))
+      |> withTerminator (fst term)
+      |> withQuote (charOf (fst quote))
+      |> withEscape (Maybe.map charOf (fst escape))
+      |> withDoubleQuote (fst doubled)
+      |> withQuoting (fst quoting)
+      |> withComment (Maybe.map charOf (fst comment))
+      |> withFlexible (fst flexible)
+      |> withHasHeaders (fst headers)
+      |> withTrim (V.getOr Trim.NoTrim trims (fst trim))
+      |> withBufferCapacity (fst capacity)
+  in
+  (if fst ascii then withAscii b else b, snd ascii)
+
+-- One operation on the reader: what the crate saw, what the port sees, and
+-- the reader after it.
+@cfg(test)
+fun readOp s i (r : Reader) =
+  let op = num s i 1 in
+  let at = snd op in
+  match fst op with
+  | 0 ->
+      let want = readSeen s at in
+      (match readRecord r with
+       | (result, r1) -> ((fst want, seenText result), snd want, r1))
+  | 1 ->
+      let want = readSeen s at in
+      (match readByteRecord r with
+       | (result, r1) -> ((fst want, seenBytes result), snd want, r1))
+  | 2 ->
+      let want = readSeen s at in
+      (match headers r with
+       | (result, r1) -> ((fst want, seenText (Result.map Just result)), snd want, r1))
+  | 3 ->
+      let want = readSeen s at in
+      (match byteHeaders r with
+       | (result, r1) -> ((fst want, seenBytes (Result.map Just result)), snd want, r1))
+  | 4 ->
+      let n = num s at 1 in
+      let fields = listOf (fst n) (snd n) (\p -> bytesAt s p) in
+      ((Seen.Nothing, Seen.Nothing), snd fields, setHeaders (V.map bytesToString (fst fields)) r)
+  | 5 ->
+      let n = num s at 1 in
+      let fields = listOf (fst n) (snd n) (\p -> bytesAt s p) in
+      ((Seen.Nothing, Seen.Nothing), snd fields, setByteHeaders (fst fields) r)
+  | 6 ->
+      let n = num s at 2 in
+      let want = listOf (fst n) (snd n) (\p -> readSeen s p) in
+      (match records r with
+       | (results, r1) ->
+           let got = V.map (\x -> seenText (Result.map Just x)) results in
+           ((Seen.Many (fst want), Seen.Many got), snd want, r1))
+  | _ ->
+      let n = num s at 2 in
+      let want = listOf (fst n) (snd n) (\p -> readSeen s p) in
+      (match byteRecords r with
+       | (results, r1) ->
+           let got = V.map (\x -> seenBytes (Result.map Just x)) results in
+           ((Seen.Many (fst want), Seen.Many got), snd want, r1))
+
+@cfg(test)
+fun runReading i =
+  let s = readings in
+  let b = readReaderConfig s i in
+  let input = bytesAt s (snd b) in
+  let ops = num s (snd input) 1 in
+  let done =
+    times (fst ops) (snd ops) (V.empty, V.empty, fromBytes (fst input) (fst b)) (\at (wants, gots, r) ->
+      match readOp s at r with
+      | ((want, got), next, r1) -> ((V.pushBack wants want, V.pushBack gots got, r1), next))
+  in
+  match fst done with
+  | (wants, gots, r) ->
+      let pos = readPosition s (snd done) in
+      let ended = flag s (snd pos) in
+      let wantEnd =
+        match fst pos with
+        | Just p -> Seen.Ended p (fst ended)
+        | None -> Seen.Nothing
+      in
+      ((V.pushBack wants wantEnd, V.pushBack gots (Seen.Ended (position r) (isDone r))), snd ended)
+
+@cfg(test)
+fun checkAll s run i n bad =
+  if i >= stringByteLength s
+  then (n, bad)
+  else
+    match run i with
+    | ((want, got), next) -> checkAll s run next (n + 1) (if want == got then bad else V.pushBack bad (n, want, got))
+
+-- The number of readings, and the first few the port does differently.
+@cfg(test)
+@test fun readingsMatchTheCrate () =
+  match checkAll readings runReading 0 0 V.empty with
+  | (n, bad) -> assertEq (n, V.take bad 1) (1500, []) "readings the port and csv do differently"
+
+@cfg(test)
+def terminators = [Terminator.CRLF, Terminator.Any 10, Terminator.Any 13, Terminator.Any 59, Terminator.Any 124]
+
+@cfg(test)
+def styles = [QuoteStyle.Always, QuoteStyle.Necessary, QuoteStyle.NonNumeric, QuoteStyle.Never]
+
+@cfg(test)
+fun runWriting i =
+  let s = writings in
+  let delimiter = num s i 2 in
+  let term = num s (snd delimiter) 1 in
+  let style = num s (snd term) 1 in
+  let quote = num s (snd style) 2 in
+  let escape = num s (snd quote) 2 in
+  let doubled = flag s (snd escape) in
+  let comment = maybeByte s (snd doubled) in
+  let flexible = flag s (snd comment) in
+  let capacity = num s (snd flexible) 3 in
+  let b =
+    writerBuilder
+      |> withDelimiter (charOf (fst delimiter))
+      |> withTerminator (V.getOr Terminator.CRLF terminators (fst term))
+      |> withQuoteStyle (V.getOr QuoteStyle.Necessary styles (fst style))
+      |> withQuote (charOf (fst quote))
+      |> withWriterEscape (charOf (fst escape))
+      |> withDoubleQuote (fst doubled)
+      |> withComment (Maybe.map charOf (fst comment))
+      |> withFlexible (fst flexible)
+      |> withBufferCapacity (fst capacity)
+  in
+  let ops = num s (snd capacity) 1 in
+  let done =
+    times (fst ops) (snd ops) (V.empty, V.empty, writer b) (\at (wants, gots, w) ->
+      let op = num s at 1 in
+      let applied =
+        match fst op with
+        | 0 ->
+            let f = bytesAt s (snd op) in
+            ((Ok (), writeByteField (fst f) w), snd f)
+        | 3 -> ((Ok (), flush w), snd op)
+        | k ->
+            let n = num s (snd op) 1 in
+            let fields = listOf (fst n) (snd n) (\p -> bytesAt s p) in
+            if k == 1
+            then (writeRecordBytes (fst fields) w, snd fields)
+            else (writeByteRecord (fst fields) w, snd fields)
+      in
+      match applied with
+      | ((result, w1), next) ->
+          let ok = flag s next in
+          let want = if fst ok then (Seen.Nothing, snd ok) else mapFst Seen.Failed (str s (snd ok)) in
+          let got =
+            match result with
+            | Ok () -> Seen.Nothing
+            | Err e -> Seen.Failed (errorMessage e)
+          in
+          ((V.pushBack wants (fst want), V.pushBack gots got, w1), snd want))
+  in
+  match fst done with
+  | (wants, gots, w) ->
+      let written = bytesAt s (snd done) in
+      ((V.pushBack wants (Seen.Got [fst written] None), V.pushBack gots (Seen.Got [toBytes w] None)), snd written)
+
+@cfg(test)
+@test fun writingsMatchTheCrate () =
+  match checkAll writings runWriting 0 0 V.empty with
+  | (n, bad) -> assertEq (n, V.take bad 1) (1500, []) "writings the port and csv do differently"
+
+@cfg(test)
+fun runNumber i =
+  let t = str numbers i in
+  let want = flag numbers (snd t) in
+  ((fst want, isNonNumeric (stringToBytes (fst t))), snd want)
+
+@cfg(test)
+@test fun numbersMatchTheCrate () =
+  match checkAll numbers runNumber 0 0 V.empty with
+  | (n, bad) -> assertEq (n, V.take bad 3) (536, []) "strings the port and csv-core take differently"
+
+-- --- examples -----------------------------------------------------------------------------
+
+@cfg(test)
+@test fun examples () =
+  let a =
+    assertEq
+      (Result.map (V.map (\(r : StringRecord) -> r.fields)) (readAll "name,age\nAda,36\n" readerBuilder))
+      (Ok [["Ada", "36"]])
+      "read"
+  in
+  assertEq (writeAll [["a", "b,c"], ["d", "e"]] writerBuilder) (Ok "a,\"b,c\"\nd,e\n") "write"
+
+-- A comment at the very end, with no line feed after it, reads as an empty
+-- record, as the crate reads it.
+@cfg(test)
+@test fun trailingComment () =
+  let b = readerBuilder |> withHasHeaders False |> withComment (Just '#') in
+  let fieldsOf = \text -> Result.map (V.map (\(r : StringRecord) -> r.fields)) (readAll text b) in
+  let a = assertEq (fieldsOf "a\n#c") (Ok [["a"], [""]]) "no line feed" in
+  assertEq (fieldsOf "a\n#c\n") (Ok [["a"]]) "a line feed"
+
+-- The README's example.
+@cfg(test)
+@test fun readmeExample () =
+  let input = "city;population\nOslo;709037\n\"Den Haag\";552995\n" in
+  let out =
+    match readAll input (readerBuilder |> withDelimiter ';') with
+    | Ok rows ->
+        let quoted = writerBuilder |> withQuoteStyle QuoteStyle.Always in
+        writeAll (V.map (\(r : StringRecord) -> V.reverse r.fields) rows) quoted
+    | Err e -> Err e
+  in
+  assertEq out (Ok "\"709037\",\"Oslo\"\n\"552995\",\"Den Haag\"\n") "reversed and quoted"

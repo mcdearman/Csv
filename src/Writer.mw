@@ -1,0 +1,195 @@
+-- Writing CSV: the crate's `writer.rs`. The writer keeps the crate's buffer
+-- as a count of the bytes in it, since whether a record takes the crate's
+-- fast path depends on the room left, and the fast path does not keep the
+-- parser-side state the slow one keeps.
+--
+-- Copyright Andrew Gallant and the rust-csv contributors, and the Meadow
+-- port's authors. Licensed under MIT or the Unlicense: see LICENSE-MIT,
+-- UNLICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.Char as C
+use csv.Core
+use csv.Record
+
+-- How to write: the crate's `WriterBuilder`, with its defaults. Change it
+-- with the `with` functions it shares with `readerBuilder`, and
+-- `withQuoteStyle` and `withWriterEscape`.
+@pub def writerBuilder =
+  {
+    capacity = (toInt 8192),
+    flexible = False,
+    hasHeaders = True,
+    delimiter = (toInt 44),
+    terminator = Terminator.Any 10,
+    style = QuoteStyle.Necessary,
+    quote = (toInt 34),
+    escape = (toInt 92),
+    doubleQuote = True,
+    comment = None
+  }
+
+-- When fields are quoted: `Always`, `Necessary` (the default), `NonNumeric`
+-- or `Never`.
+@pub fun withQuoteStyle s b = { b | style = s }
+
+-- The writer's escape character, used before a quote when quotes are not
+-- doubled. It is `\` by default.
+@pub fun withWriterEscape c b = { b | escape = C.code c % 256 }
+
+-- A writer, what it has written, and what is in its buffer.
+@pub record Writer = {
+  core : CoreWriter,
+  capacity : Int,
+  buffered : Int,
+  out : [UInt8],
+  flexible : Bool,
+  firstFieldCount : Maybe Int,
+  fieldsWritten : Int
+}
+
+-- A writer configured by `b`.
+@pub fun writer b =
+  let cfg =
+    WriterConfig {
+      delimiter = b.delimiter,
+      term = b.terminator,
+      style = b.style,
+      quote = b.quote,
+      escape = b.escape,
+      doubleQuote = b.doubleQuote,
+      comment = b.comment
+    }
+  in
+  Writer {
+    core = coreWriter cfg,
+    capacity = b.capacity,
+    buffered = 0,
+    out = V.empty,
+    flexible = b.flexible,
+    firstFieldCount = None,
+    fieldsWritten = 0
+  }
+
+fun room (w : Writer) = w.capacity - w.buffered
+
+fun emit bytes (w : Writer) = { w | out = V.append w.out bytes, buffered = w.buffered + V.len bytes }
+
+-- Empties the buffer: the crate's `flush`. The bytes are kept in `out`
+-- already, so only the room changes.
+@pub fun flush (w : Writer) = { w | buffered = 0 }
+
+-- Runs a core step until it fits, flushing when the buffer is full.
+fun untilFits step (w : Writer) =
+  match step w with
+  | (True, w1) -> w1
+  | (False, w1) -> untilFits step (flush w1)
+
+fun writeDelimiterStep (w : Writer) =
+  untilFits
+    (\(x : Writer) ->
+      match writeDelimiter x.core (room x) with
+      | (done, bytes, core) -> (done, emit bytes { x | core = core }))
+    w
+
+fun fieldImpl (bytes : #[UInt8]) (w : Writer) =
+  let w1 = if w.fieldsWritten > 0 then writeDelimiterStep w else w in
+  let rec go from (x : Writer) =
+    match writeField x.core bytes from (room x) with
+    | (True, _, out, core) -> emit out { x | core = core }
+    | (False, used, out, core) -> go (from + used) (flush (emit out { x | core = core }))
+  in
+  let w2 = go 0 w1 in
+  { w2 | fieldsWritten = w2.fieldsWritten + 1 }
+
+fun checkFieldCount (w : Writer) =
+  if w.flexible
+  then Ok w
+  else
+    match w.firstFieldCount with
+    | None -> Ok { w | firstFieldCount = Just w.fieldsWritten }
+    | Just expected ->
+        if expected != w.fieldsWritten then Err (CsvError.UnequalLengths None expected w.fieldsWritten) else Ok w
+
+fun terminatorImpl (w : Writer) =
+  match checkFieldCount w with
+  | Err e -> (Err e, w)
+  | Ok w1 ->
+      let w2 =
+        untilFits
+          (\(x : Writer) ->
+            match writeTerminator x.core (room x) with
+            | (done, bytes, core) -> (done, emit bytes { x | core = core }))
+          w1
+      in
+      (Ok (), { w2 | fieldsWritten = 0 })
+
+-- Writes one field of a record: the crate's `write_field`.
+@pub fun writeByteField (bytes : #[UInt8]) (w : Writer) = fieldImpl bytes w
+
+@pub fun writeField text (w : Writer) = fieldImpl (stringToBytes text) w
+
+-- Writes a record of bytes and ends it, a field at a time: the crate's
+-- `write_record`. On an error, the fields are written but the record is not
+-- ended.
+@pub fun writeRecordBytes fields (w : Writer) = terminatorImpl (V.foldl (\x f -> fieldImpl f x) w fields)
+
+-- Writes a record of text and ends it.
+@pub fun writeRecord fields (w : Writer) = writeRecordBytes (V.map stringToBytes fields) w
+
+-- Writes a record of bytes: the crate's `write_byte_record`, which copies a
+-- record straight into the buffer when it is sure to fit.
+@pub fun writeByteRecord (fields : [#[UInt8]]) (w : Writer) =
+  let total = V.foldl (\n (f : #[UInt8]) -> n + arrayLen f) 0 fields in
+  let count = V.len fields in
+  let upperBound = 2 * total + max 0 (count - 1) + 2 * count + 2 in
+  if total == 0 or room w < upperBound
+  then writeRecordBytes fields w
+  else
+    let core = w.core in
+    let cfg = core.cfg in
+    let quoteByte = toUInt8 cfg.quote in
+    let pieces =
+      V.map
+        (\(i, (f : #[UInt8])) ->
+          let sep = if i > 0 then [toUInt8 cfg.delimiter] else V.empty in
+          if shouldQuote core f
+          then
+            match quoteInto f 0 (2 * arrayLen f) cfg.quote cfg.escape cfg.doubleQuote with
+            | (_, _, quoted) -> V.concat [sep, [quoteByte], quoted, [quoteByte]]
+          else V.append sep (V.fromArray f))
+        (V.zip (V.range 0 count) fields)
+    in
+    let w1 = { (emit (V.concat pieces) w) | fieldsWritten = count } in
+    match checkFieldCount w1 with
+    | Err e -> (Err e, w1)
+    | Ok w2 ->
+        let term =
+          match cfg.term with
+          | Terminator.CRLF -> [toUInt8 13, toUInt8 10]
+          | Terminator.Any b -> [toUInt8 b]
+        in
+        (Ok (), { (emit term w2) | fieldsWritten = 0 })
+
+-- Everything written, as bytes: the crate's `into_inner` after a flush.
+@pub fun toBytes (w : Writer) = V.toArray w.out
+
+-- Everything written, as text.
+@pub fun toText (w : Writer) = bytesToString (toBytes w)
+
+-- `rows` written as `b` says, or the first error.
+@pub fun writeAll rows b =
+  V.foldl
+    (\acc row ->
+      match acc with
+      | Ok w ->
+          (match writeRecord row w with
+           | (Ok (), w1) -> Ok w1
+           | (Err e, _) -> Err e)
+      | Err e -> Err e)
+    (Ok (writer b))
+    rows
+    |> (\result ->
+      match result with
+      | Ok w -> Ok (toText w)
+      | Err e -> Err e)

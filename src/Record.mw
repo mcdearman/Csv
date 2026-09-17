@@ -1,0 +1,181 @@
+-- Records, positions and errors: the crate's `byte_record.rs`,
+-- `string_record.rs` and `error.rs`.
+--
+-- Copyright Andrew Gallant and the rust-csv contributors, and the Meadow
+-- port's authors. Licensed under MIT or the Unlicense: see LICENSE-MIT,
+-- UNLICENSE and COPYRIGHT.
+
+use Std.Collections.Vector as V
+use Std.Char as C
+
+-- Where a record starts: its byte offset, its line (from 1) and its index
+-- among the records read (from 0).
+@pub record Position = { byte : Int, line : Int, index : Int }
+
+@pub(pkg) def startPosition = Position { byte = 0, line = 1, index = 0 }
+
+-- A record of fields as bytes, and where it was read, if it was.
+@pub record ByteRecord = { fields : [#[UInt8]], position : Maybe Position }
+
+-- A record of fields as text, and where it was read, if it was.
+@pub record StringRecord = { fields : [String], position : Maybe Position }
+
+@pub fun byteRecord fields = ByteRecord { fields = fields, position = None }
+
+@pub fun stringRecord fields = StringRecord { fields = fields, position = None }
+
+-- The field at `i`.
+@pub fun field i (r : StringRecord) = V.get r.fields i
+
+@pub fun byteField i (r : ByteRecord) = V.get r.fields i
+
+-- A record as the crate keeps it: its fields and position, and the room its
+-- buffers have, on which how the reader reads it depends.
+@pub(pkg) record Filled = { fields : [#[UInt8]], position : Maybe Position, fieldsCap : Int, endsCap : Int }
+
+@pub(pkg) def emptyFilled = Filled { fields = V.empty, position = None, fieldsCap = 0, endsCap = 0 }
+
+fun grow cap need = if cap >= need then cap else grow (if 2 * cap > 4 then 2 * cap else 4) need
+
+-- A record built a field at a time, as `StringRecord::from(vec)` builds it.
+@pub(pkg) fun filledOf fields =
+  let total = V.foldl (\n (f : #[UInt8]) -> n + arrayLen f) 0 fields in
+  Filled { fields = fields, position = None, fieldsCap = grow 0 total, endsCap = grow 0 (V.len fields) }
+
+@pub(pkg) fun totalBytes (f : Filled) = V.foldl (\n (x : #[UInt8]) -> n + arrayLen x) 0 f.fields
+
+@pub(pkg) fun toByteRecord (f : Filled) = ByteRecord { fields = f.fields, position = f.position }
+
+-- --- UTF-8 --------------------------------------------------------------------------------
+
+-- The length of the valid UTF-8 prefix of `bytes`, or `None` if it is all
+-- valid: Rust's `Utf8Error::valid_up_to`.
+@pub(pkg) fun invalidUtf8At (bytes : #[UInt8]) =
+  let n = arrayLen bytes in
+  let at = \i -> if i < n then toInt (arrayGet bytes i) else 0 - 1 in
+  let cont = \i lo hi -> at i >= lo and at i <= hi in
+  let rec go i =
+    if i >= n
+    then None
+    else
+      let b = at i in
+      let len =
+        if b < 128
+        then 1
+        else if b >= 194 and b <= 223
+        then (if cont (i + 1) 128 191 then 2 else 0)
+        else if b == 224
+        then (if cont (i + 1) 160 191 and cont (i + 2) 128 191 then 3 else 0)
+        else if (b >= 225 and b <= 236) or b == 238 or b == 239
+        then (if cont (i + 1) 128 191 and cont (i + 2) 128 191 then 3 else 0)
+        else if b == 237
+        then (if cont (i + 1) 128 159 and cont (i + 2) 128 191 then 3 else 0)
+        else if b == 240
+        then (if cont (i + 1) 144 191 and cont (i + 2) 128 191 and cont (i + 3) 128 191 then 4 else 0)
+        else if b >= 241 and b <= 243
+        then (if cont (i + 1) 128 191 and cont (i + 2) 128 191 and cont (i + 3) 128 191 then 4 else 0)
+        else if b == 244
+        then (if cont (i + 1) 128 143 and cont (i + 2) 128 191 and cont (i + 3) 128 191 then 4 else 0)
+        else 0
+      in
+      if len == 0 then Just i else go (i + len)
+  in
+  go 0
+
+-- The first field that is not UTF-8, and how far into it the valid text
+-- goes.
+@pub(pkg) fun validate (f : Filled) =
+  let rec go i =
+    match V.get f.fields i with
+    | None -> None
+    | Just bytes ->
+        match invalidUtf8At bytes with
+        | Just upTo -> Just (i, upTo)
+        | None -> go (i + 1)
+  in
+  go 0
+
+@pub(pkg) fun toStringRecord (f : Filled) =
+  StringRecord { fields = V.map bytesToString f.fields, position = f.position }
+
+-- --- trimming -----------------------------------------------------------------------------
+
+fun isAsciiSpace b = b == 32 or b == 9 or b == 10 or b == 12 or b == 13
+
+fun trimAscii (bytes : #[UInt8]) =
+  let n = arrayLen bytes in
+  let rec start i = if i < n and isAsciiSpace (toInt (arrayGet bytes i)) then start (i + 1) else i in
+  let rec stop j lo = if j > lo and isAsciiSpace (toInt (arrayGet bytes (j - 1))) then stop (j - 1) lo else j in
+  let s = start 0 in
+  arraySlice bytes s (stop n s)
+
+-- Unicode's `White_Space` property, as Rust's `char::is_whitespace` has it.
+fun isWhitespace c =
+  let n = C.code c in
+  (n >= 9 and n <= 13)
+    or n == 32
+    or n == 133
+    or n == 160
+    or n == 5760
+    or (n >= 8192 and n <= 8202)
+    or n == 8232
+    or n == 8233
+    or n == 8239
+    or n == 8287
+    or n == 12288
+
+fun trimUnicode (bytes : #[UInt8]) =
+  let cs = stringToChars (bytesToString bytes) in
+  let n = arrayLen cs in
+  let rec start i = if i < n and isWhitespace (arrayGet cs i) then start (i + 1) else i in
+  let rec stop j lo = if j > lo and isWhitespace (arrayGet cs (j - 1)) then stop (j - 1) lo else j in
+  let s = start 0 in
+  stringToBytes (charsToString (arraySlice cs s (stop n s)))
+
+-- The record with each field trimmed, rebuilt as the crate rebuilds it: with
+-- buffers just the size of what it held.
+fun trimWith trim (f : Filled) =
+  if V.isEmpty f.fields
+  then f
+  else
+    Filled {
+      fields = V.map trim f.fields,
+      position = f.position,
+      fieldsCap = totalBytes f,
+      endsCap = V.len f.fields
+    }
+
+-- ASCII whitespace off each field: `ByteRecord::trim`.
+@pub(pkg) fun trimBytes f = trimWith trimAscii f
+
+-- Unicode whitespace off each field, which must be UTF-8:
+-- `StringRecord::trim`.
+@pub(pkg) fun trimText f = trimWith trimUnicode f
+
+-- --- errors -------------------------------------------------------------------------------
+
+-- What went wrong.
+@pub data CsvError =
+  | Utf8 (Maybe Position) Int Int
+  | UnequalLengths (Maybe Position) Int Int
+
+-- The error's message, as the crate displays it.
+@pub fun errorMessage e =
+  match e with
+  | CsvError.Utf8 (Just p) fieldIndex upTo ->
+      let place = "record ${p.index} (line ${p.line}, field: ${fieldIndex}, byte: ${p.byte})" in
+      "CSV parse error: ${place}: ${utf8Message fieldIndex upTo}"
+  | CsvError.Utf8 None fieldIndex upTo -> "CSV parse error: field ${fieldIndex}: ${utf8Message fieldIndex upTo}"
+  | CsvError.UnequalLengths (Just p) expected len ->
+      "CSV error: record ${p.index} (line: ${p.line}, byte: ${p.byte}): ${lengthsMessage expected len}"
+  | CsvError.UnequalLengths None expected len -> "CSV error: ${lengthsMessage expected len}"
+
+fun utf8Message fieldIndex upTo = "invalid utf-8: invalid UTF-8 in field ${fieldIndex} near byte index ${upTo}"
+
+fun lengthsMessage expected len = "found record with ${len} fields, but the previous record has ${expected} fields"
+
+-- Where the error was, if the crate knows.
+@pub fun errorPosition e =
+  match e with
+  | CsvError.Utf8 p _ _ -> p
+  | CsvError.UnequalLengths p _ _ -> p
