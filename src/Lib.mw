@@ -1,7 +1,7 @@
 -- csv: reading and writing CSV. A port of Rust's `csv` crate, version 1.4.0,
 -- and the `csv-core` 0.1.13 parser underneath it, without serde.
 --
---   use csv (readerBuilder, readAll, writerBuilder, writeAll)
+--   use Csv (readerBuilder, readAll, writerBuilder, writeAll)
 --
 --   readAll "name,age\nAda,36\n" readerBuilder
 --     -- Ok [StringRecord ["Ada", "36"]], the headers skipped
@@ -17,14 +17,14 @@ mod Cases
 @cfg(test)
 mod Tests
 
-@pub use csv.Core (Terminator, QuoteStyle, isNonNumeric)
-@pub use csv.Core.Terminator.*
-@pub use csv.Core.QuoteStyle.*
-@pub use csv.Record (
+@pub use Csv.Core (Terminator, QuoteStyle, isNonNumeric)
+@pub use Csv.Core.Terminator.*
+@pub use Csv.Core.QuoteStyle.*
+@pub use Csv.Record (
   Position, ByteRecord, StringRecord, byteRecord, stringRecord, field, byteField, CsvError, errorMessage,
   errorPosition,
 )
-@pub use csv.Record.CsvError.*
-@pub use csv.Reader
-@pub use csv.Reader.Trim.*
-@pub use csv.Writer
+@pub use Csv.Record.CsvError.*
+@pub use Csv.Reader
+@pub use Csv.Reader.Trim.*
+@pub use Csv.Writer

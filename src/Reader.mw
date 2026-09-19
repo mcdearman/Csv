@@ -11,8 +11,8 @@
 use Std.Collections.Vector as V
 use Std.Char as C
 use Std.Maybe as M
-use csv.Core
-use csv.Record
+use Csv.Core
+use Csv.Record
 
 -- Which fields and headers are trimmed of whitespace.
 @pub data Trim = NoTrim | Headers | Fields | All

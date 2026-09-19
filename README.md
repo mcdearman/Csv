@@ -13,13 +13,13 @@ messages. Serde support is not ported: records are lists of fields.
 ## Install
 
 ```sh
-meadow add mcdearman/meadow-csv
+meadow add mcdearman/MeadowCsv
 ```
 
 ## Use
 
 ```meadow
-use csv
+use Csv
 use Std.Collections.Vector as V
 
 def input = "city;population\nOslo;709037\n\"Den Haag\";552995\n"

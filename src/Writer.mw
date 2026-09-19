@@ -9,8 +9,8 @@
 
 use Std.Collections.Vector as V
 use Std.Char as C
-use csv.Core
-use csv.Record
+use Csv.Core
+use Csv.Record
 
 -- How to write: the crate's `WriterBuilder`, with its defaults. Change it
 -- with the `with` functions it shares with `readerBuilder`, and

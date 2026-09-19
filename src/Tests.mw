@@ -16,15 +16,15 @@ use Std.Maybe as Maybe
 @cfg(test)
 use Std.Char as C
 @cfg(test)
-use csv.Cases (readings, writings, numbers)
+use Csv.Cases (readings, writings, numbers)
 @cfg(test)
-use csv.Core
+use Csv.Core
 @cfg(test)
-use csv.Record
+use Csv.Record
 @cfg(test)
-use csv.Reader
+use Csv.Reader
 @cfg(test)
-use csv.Writer
+use Csv.Writer
 
 -- --- reading the cases --------------------------------------------------------------------
 
