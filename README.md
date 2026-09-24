@@ -13,7 +13,7 @@ messages. Serde support is not ported: records are lists of fields.
 ## Install
 
 ```sh
-meadow add mcdearman/MeadowCsv
+meadow add mcdearman/Csv
 ```
 
 ## Use
