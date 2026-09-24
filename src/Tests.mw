@@ -75,6 +75,7 @@ fun charOf b = C.fromCode b
 
 -- What an operation gave, in a form both sides can be compared in.
 @cfg(test)
+@derive(PartialEq)
 data Seen = Nothing | Got [#[UInt8]] (Maybe Position) | Failed String | Many [Seen] | Ended Position Bool
 
 @cfg(test)

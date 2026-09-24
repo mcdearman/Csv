@@ -10,6 +10,7 @@ use Std.Char as C
 
 -- Where a record starts: its byte offset, its line (from 1) and its index
 -- among the records read (from 0).
+@derive(PartialEq)
 @pub record Position = { byte : Int, line : Int, index : Int }
 
 @pub(pkg) def startPosition = Position { byte = 0, line = 1, index = 0 }
